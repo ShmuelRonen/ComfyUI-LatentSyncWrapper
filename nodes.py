@@ -194,194 +194,172 @@ class LatentSyncNode:
     RETURN_NAMES = ("images", "audio") 
     FUNCTION = "inference"
 
+    def process_batch(self, batch, use_mixed_precision=False):
+        with torch.cuda.amp.autocast(enabled=use_mixed_precision):
+            processed_batch = batch.float() / 255.0
+            if len(processed_batch.shape) == 3:
+                processed_batch = processed_batch.unsqueeze(0)
+            if processed_batch.shape[0] == 3:
+                processed_batch = processed_batch.permute(1, 2, 0)
+            if processed_batch.shape[-1] == 4:
+                processed_batch = processed_batch[..., :3]
+            return processed_batch
+
     def inference(self, images, audio, seed):
-        # Existing inference logic
-        cur_dir = get_ext_dir()
-        ckpt_dir = os.path.join(cur_dir, "checkpoints")
-        output_dir = folder_paths.get_output_directory()
-        temp_dir = os.path.join(output_dir, "temp_frames")
-        os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(temp_dir, exist_ok=True)
+        # Get GPU capabilities and memory
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        BATCH_SIZE = 4
+        use_mixed_precision = False
+        if torch.cuda.is_available():
+            gpu_mem = torch.cuda.get_device_properties(0).total_memory
+            # Convert to GB
+            gpu_mem_gb = gpu_mem / (1024 ** 3)
 
-        # Create a temporary video file from the input frames
-        output_name = ''.join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))
-        temp_video_path = os.path.join(output_dir, f"temp_{output_name}.mp4")
-        output_video_path = os.path.join(output_dir, f"latentsync_{output_name}_out.mp4")
+            # Dynamically adjust batch size based on GPU memory
+            # Conservative estimate - adjust these thresholds based on testing
+            if gpu_mem_gb > 20:  # High-end GPUs (A100, A6000, etc)
+                BATCH_SIZE = 32
+                enable_tf32 = True
+                use_mixed_precision = True
+            elif gpu_mem_gb > 8:  # Mid-range GPUs (RTX 3070, 4060 Ti, etc)
+                BATCH_SIZE = 16
+                enable_tf32 = False
+                use_mixed_precision = True
+            else:  # Lower-end GPUs
+                BATCH_SIZE = 8
+                enable_tf32 = False
+                use_mixed_precision = False
 
-        # Save frames as temporary video
-        import torchvision.io as io
-        if isinstance(images, list):
-            frames = torch.stack(images)
-        else:
-            frames = images
-        print(f"Initial frame count: {frames.shape[0]}")
+            # Set performance options based on GPU capability
+            torch.backends.cudnn.benchmark = True
+            if enable_tf32:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
 
-        frames = (frames * 255).byte()
-        if len(frames.shape) == 3:
-            frames = frames.unsqueeze(0)
-        print(f"Frame count before writing video: {frames.shape[0]}")
+            # Clear GPU cache before processing
+            torch.cuda.empty_cache()
 
-        if isinstance(frames, torch.Tensor):
-            frames = frames.cpu()
+            # Set conservative memory fraction
+            torch.cuda.set_per_process_memory_fraction(0.8)  # Use up to 80% of GPU memory
+
         try:
-            io.write_video(temp_video_path, frames, fps=25, video_codec='h264')
-        except TypeError:
-            # Fallback for newer versions
-            import av
-            container = av.open(temp_video_path, mode='w')
-            stream = container.add_stream('h264', rate=25)
-            stream.width = frames.shape[2]
-            stream.height = frames.shape[1]
-            
-            for frame in frames:
-                frame = av.VideoFrame.from_ndarray(frame.numpy(), format='rgb24')
-                packet = stream.encode(frame)
+            cur_dir = get_ext_dir()
+            output_dir = folder_paths.get_output_directory()
+            temp_dir = os.path.join(output_dir, "temp_frames")
+            os.makedirs(output_dir, exist_ok=True)
+            os.makedirs(temp_dir, exist_ok=True)
+
+            output_name = ''.join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))
+            temp_video_path = os.path.join(output_dir, f"temp_{output_name}.mp4")
+            output_video_path = os.path.join(output_dir, f"latentsync_{output_name}_out.mp4")
+            # Move tensors to appropriate device
+            if isinstance(images, list):
+                frames = torch.stack(images).to(device)
+            else:
+                frames = images.to(device)
+            frames = (frames * 255).byte()
+
+            if len(frames.shape) == 3:
+                frames = frames.unsqueeze(0)
+
+            # Process audio with device awareness
+            waveform = audio["waveform"].to(device)
+            sample_rate = audio["sample_rate"]
+            if waveform.dim() == 3:
+                waveform = waveform.squeeze(0)
+
+            if sample_rate != 16000:
+                new_sample_rate = 16000
+                resampler = torchaudio.transforms.Resample(
+                    orig_freq=sample_rate,
+                    new_freq=new_sample_rate
+                ).to(device)
+                waveform_16k = resampler(waveform)
+                waveform, sample_rate = waveform_16k, new_sample_rate
+
+            # Package resampled audio
+            resampled_audio = {
+                "waveform": waveform.unsqueeze(0),  # Add batch dim
+                "sample_rate": sample_rate
+            }
+            audio_path = os.path.join(output_dir, f"latentsync_{output_name}_audio.wav")
+            waveform_cpu = waveform.cpu()
+            torchaudio.save(audio_path, waveform_cpu, sample_rate)
+
+            try:
+                import torchvision.io as io
+                io.write_video(temp_video_path, frames.cpu(), fps=25, video_codec='h264')
+            except TypeError:
+                import av
+                container = av.open(temp_video_path, mode='w')
+                stream = container.add_stream('h264', rate=25)
+                stream.width = frames.shape[2]
+                stream.height = frames.shape[1]
+
+                for frame in frames:
+                    frame = av.VideoFrame.from_ndarray(frame.cpu().numpy(), format='rgb24')
+                    packet = stream.encode(frame)
+                    container.mux(packet)
+
+                packet = stream.encode(None)
                 container.mux(packet)
-            
-            # Flush stream
-            packet = stream.encode(None)
-            container.mux(packet)
-            container.close()
-        video_path = normalize_path(temp_video_path)
+                container.close()
 
-        if not os.path.exists(ckpt_dir):
-            print("Downloading model checkpoints... This may take a while.")
-            from huggingface_hub import snapshot_download
-            snapshot_download(repo_id="chunyu-li/LatentSync",
-                                    allow_patterns=["latentsync_unet.pt", "whisper/tiny.pt"],
-                                    local_dir=ckpt_dir, local_dir_use_symlinks=False)
-            print("Model checkpoints downloaded successfully!")
+            inference_script_path = os.path.join(cur_dir, "scripts", "inference.py")
+            config_path = os.path.join(cur_dir, "configs", "unet", "second_stage.yaml")
+            scheduler_config_path = os.path.join(cur_dir, "configs")
+            ckpt_path = os.path.join(cur_dir, "checkpoints", "latentsync_unet.pt")
+            whisper_ckpt_path = os.path.join(cur_dir, "checkpoints", "whisper", "tiny.pt")
 
-        inference_script_path = os.path.join(cur_dir, "scripts", "inference.py")
-        unet_config_path = normalize_path(os.path.join(cur_dir, "configs", "unet", "second_stage.yaml"))
-        scheduler_config_path = normalize_path(os.path.join(cur_dir, "configs"))
-        ckpt_path = normalize_path(os.path.join(ckpt_dir, "latentsync_unet.pt"))
-        whisper_ckpt_path = normalize_path(os.path.join(ckpt_dir, "whisper", "tiny.pt"))
-
-        # resample audio to 16k hz and save to wav
-        waveform = audio["waveform"]
-        sample_rate = audio["sample_rate"]
-
-        if waveform.dim() == 3: # Expected shape: [channels, samples]
-            waveform = waveform.squeeze(0)
-
-        if sample_rate != 16000:
-            new_sample_rate = 16000
-            waveform_16k = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=new_sample_rate)(waveform)
-            waveform, sample_rate = waveform_16k, new_sample_rate
-
-        # Package resampled audio
-        resampled_audio = {
-            "waveform": waveform.unsqueeze(0),  # Add batch dim
-            "sample_rate": sample_rate
-        }
-
-        audio_path = normalize_path(os.path.join(output_dir, f"latentsync_{output_name}_audio.wav"))
-        torchaudio.save(audio_path, waveform, sample_rate)
-
-        print(f"Using video path: {video_path}")
-        print(f"Video file exists: {os.path.exists(video_path)}")
-        print(f"Video file size: {os.path.getsize(video_path)} bytes")
-
-        assert os.path.exists(video_path), f"video_path not exists: {video_path}"
-        assert os.path.exists(audio_path), f"audio_path not exists: {audio_path}"
-
-        try:
-            # Add the package root to Python path
-            package_root = os.path.dirname(cur_dir)
-            if package_root not in sys.path:
-                sys.path.insert(0, package_root)
-               
-            # Add the current directory to Python path
-            if cur_dir not in sys.path:
-                sys.path.insert(0, cur_dir)
-
-            # Import the inference module
-            inference_module = import_inference_script(inference_script_path)
-           
-            # Create a Namespace object with the arguments
+            config = OmegaConf.load(config_path)
             args = argparse.Namespace(
-                unet_config_path=unet_config_path,
+                unet_config_path=config_path,
                 inference_ckpt_path=ckpt_path,
-                video_path=video_path,
+                video_path=temp_video_path,
                 audio_path=audio_path,
                 video_out_path=output_video_path,
                 seed=seed,
                 scheduler_config_path=scheduler_config_path,
-                whisper_ckpt_path=whisper_ckpt_path
+                whisper_ckpt_path=whisper_ckpt_path,
+                device=device,
+                batch_size=BATCH_SIZE,
+                use_mixed_precision=use_mixed_precision
             )
-           
-            # Load the config
-            config = OmegaConf.load(unet_config_path)
-           
-            # Call main with both config and args
+
+            # Add the package root to Python path
+            package_root = os.path.dirname(cur_dir)
+            if package_root not in sys.path:
+                sys.path.insert(0, package_root)
+
+            # Add the current directory to Python path
+            if cur_dir not in sys.path:
+                sys.path.insert(0, cur_dir)
+
+            inference_module = import_inference_script(inference_script_path)
             inference_module.main(config, args)
 
-            # Load the processed video back as frames
-            processed_frames = io.read_video(output_video_path, pts_unit='sec')[0]  # [T, H, W, C]
-            print(f"Frame count after reading video: {processed_frames.shape[0]}")
-            
-            # Process frames following wav2lip.py pattern
-            out_tensor_list = []
-            for frame in processed_frames:
-                # Convert to numpy and ensure correct format
-                frame = frame.numpy()
-                
-                # Convert frame to float32 and normalize
-                frame = frame.astype(np.float32) / 255.0
-                
-                # Convert back to tensor
-                frame = torch.from_numpy(frame)
-                
-                # Ensure we have 3 channels
-                if len(frame.shape) == 2:  # If grayscale
-                    frame = frame.unsqueeze(2).repeat(1, 1, 3)
-                elif frame.shape[2] == 4:  # If RGBA
-                    frame = frame[:, :, :3]
-                
-                # Change to [C, H, W] format
-                frame = frame.permute(2, 0, 1)
-                
-                out_tensor_list.append(frame)
-
-            processed_frames = io.read_video(output_video_path, pts_unit='sec')[0]  # [T, H, W, C]
+            processed_frames = io.read_video(output_video_path, pts_unit='sec')[0]
             processed_frames = processed_frames.float() / 255.0
-            print(f"Frame count after normalization: {processed_frames.shape[0]}")
 
-            # Fix dimensions for VideoCombine compatibility
-            if len(processed_frames.shape) == 3:  
-                processed_frames = processed_frames.unsqueeze(0)
-            if processed_frames.shape[0] == 1 and len(processed_frames.shape) == 4:
-                processed_frames = processed_frames.squeeze(0)
-            if processed_frames.shape[0] == 3:  # If in CHW format
-                processed_frames = processed_frames.permute(1, 2, 0)  # Convert to HWC
-            if processed_frames.shape[-1] == 4:  # If RGBA
-                processed_frames = processed_frames[..., :3]
+            return (processed_frames, resampled_audio)
 
-            print(f"Final frame count: {processed_frames.shape[0]}")
-
-            print(f"Final shape: {processed_frames.shape}")
-
-            # Clean up
-            if os.path.exists(temp_video_path):
-                os.remove(temp_video_path)
-            if os.path.exists(output_video_path):
-                os.remove(output_video_path)
-            shutil.rmtree(temp_dir, ignore_errors=True)
-                
         except Exception as e:
-            # Clean up on error
-            if os.path.exists(temp_video_path):
-                os.remove(temp_video_path)
-            if os.path.exists(output_video_path):
-                os.remove(output_video_path)
-            shutil.rmtree(temp_dir, ignore_errors=True)
             print(f"Error during inference: {str(e)}")
             import traceback
             traceback.print_exc()
             raise
 
-        return (processed_frames, resampled_audio)
+        finally:
+            if os.path.exists(temp_video_path):
+                os.remove(temp_video_path)
+            if os.path.exists(output_video_path):
+                os.remove(output_video_path)
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 class VideoLengthAdjuster:
     @classmethod
