@@ -402,22 +402,32 @@ class VideoLengthAdjuster:
             )
 
         elif mode == "pingpong":
-            # Add silent padding then pingpong loop
-            silence_samples = math.ceil(silent_padding_sec * sample_rate)
-            silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
-            padded_audio = torch.cat([waveform, silence], dim=1)
-            total_duration = (waveform.shape[1] + silence_samples) / sample_rate
-            target_frames = math.ceil(total_duration * fps)
+            video_duration = len(original_frames) / fps
+            audio_duration = waveform.shape[1] / sample_rate
+            if audio_duration <= video_duration:
+                required_samples = int(video_duration * sample_rate)
+                silence = torch.zeros((waveform.shape[0], required_samples - waveform.shape[1]), dtype=waveform.dtype)
+                adjusted_audio = torch.cat([waveform, silence], dim=1)
 
-            reversed_frames = original_frames[::-1][1:-1]  # Remove endpoints
-            frames = original_frames + reversed_frames
-            while len(frames) < target_frames:
-                frames += frames[:target_frames - len(frames)]
-            
-            return (
-                torch.stack(frames[:target_frames]),
-                {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
-            )
+                return (
+                    torch.stack(original_frames),
+                    {"waveform": adjusted_audio.unsqueeze(0), "sample_rate": sample_rate}
+                )
+
+            else:
+                silence_samples = math.ceil(silent_padding_sec * sample_rate)
+                silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
+                padded_audio = torch.cat([waveform, silence], dim=1)
+                total_duration = (waveform.shape[1] + silence_samples) / sample_rate
+                target_frames = math.ceil(total_duration * fps)
+                reversed_frames = original_frames[::-1][1:-1]  # Remove endpoints
+                frames = original_frames + reversed_frames
+                while len(frames) < target_frames:
+                    frames += frames[:target_frames - len(frames)]
+                return (
+                    torch.stack(frames[:target_frames]),
+                    {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
+                )
 
         elif mode == "loop_to_audio":
             # Add silent padding then simple loop
