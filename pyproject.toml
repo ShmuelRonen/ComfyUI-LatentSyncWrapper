@@ -1,0 +1,15 @@
+[project]
+name = "latentsyncwrapper"
+description = "This node provides lip-sync capabilities in ComfyUI using ByteDance's LatentSync model. It allows you to synchronize video lips with audio input."
+version = "1.0.0"
+license = {file = "LICENSE"}
+dependencies = ["diffusers", "transformers", "huggingface-hub", "omegaconf", "einops", "opencv-python", "mediapipe", "face-alignment", "decord", "ffmpeg-python", "safetensors", "soundfile"]
+
+[project.urls]
+Repository = "https://github.com/ShmuelRonen/ComfyUI-LatentSyncWrapper"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "ComfyUI-LatentSyncWrapper"
+Icon = ""
