@@ -205,7 +205,7 @@ def check_ffmpeg():
                 return False
             return True
         else:
-            subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+            subprocess.run(["ffmpeg"], capture_output=True)
             return True
     except (subprocess.CalledProcessError, FileNotFoundError):
         print("FFmpeg not found. Please install FFmpeg")
@@ -459,15 +459,37 @@ class LatentSyncNode:
                 frames = images.to(device)
             frames = (frames * 255).byte()
 
-            if len(frames.shape) == 3:
-                frames = frames.unsqueeze(0)
-
-            # Process audio with device awareness
+            # Process audio data to get expected frame count for a single image
             waveform = audio["waveform"].to(device)
             sample_rate = audio["sample_rate"]
             if waveform.dim() == 3:
                 waveform = waveform.squeeze(0)
+                
+            # Check if we have a single image (either as a batch of 1 or a single 3D tensor)
+            is_single_image = False
+            if len(frames.shape) == 3:  # Single 3D tensor (H,W,C)
+                frames = frames.unsqueeze(0)
+                is_single_image = True
+            elif frames.shape[0] == 1:  # Batch of 1
+                is_single_image = True
+                
+            # If it's a single image, duplicate it to match audio duration
+            if is_single_image:
+                # Calculate audio duration in seconds
+                audio_duration = waveform.shape[1] / sample_rate
+                
+                # Calculate how many frames we need at 25fps (standard for this model)
+                required_frames = math.ceil(audio_duration * 25)
+                
+                # Duplicate the single frame to match required frame count
+                # (minimum 4 frames to avoid tensor stack issues)
+                required_frames = max(required_frames, 4)
+                single_frame = frames[0]
+                duplicated_frames = single_frame.unsqueeze(0).repeat(required_frames, 1, 1, 1)
+                frames = duplicated_frames
+                print(f"Duplicated single image to create {required_frames} frames matching audio duration")
 
+            # Resample audio if needed
             if sample_rate != 16000:
                 new_sample_rate = 16000
                 resampler = torchaudio.transforms.Resample(
@@ -685,8 +707,6 @@ class VideoLengthAdjuster:
                 torch.stack(adjusted_frames),
                 {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
             )
-            
-            # This return statement is no longer needed as it's handled in the updated code
 
         elif mode == "pingpong":
             video_duration = len(original_frames) / fps
