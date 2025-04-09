@@ -371,6 +371,7 @@ class LatentSyncNode:
                     "seed": ("INT", {"default": 1247}),
                     "lips_expression": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 3.0, "step": 0.1}),
                     "inference_steps": ("INT", {"default": 20, "min": 1, "max": 999, "step": 1}),
+                    "preserve_frame_count": ("BOOLEAN", {"default": True}),
                  },}
 
     CATEGORY = "LatentSyncNode"
@@ -390,7 +391,7 @@ class LatentSyncNode:
                 processed_batch = processed_batch[..., :3]
             return processed_batch
 
-    def inference(self, images, audio, seed, lips_expression=1.5, inference_steps=20):
+    def inference(self, images, audio, seed, lips_expression=1.5, inference_steps=20, preserve_frame_count=True):
         # Use our module temp directory
         global MODULE_TEMP_DIR
         
@@ -459,6 +460,10 @@ class LatentSyncNode:
                 frames = torch.stack(images).to(device)
             else:
                 frames = images.to(device)
+            
+            # Save original frame count for later if we need to preserve it
+            original_frame_count = frames.shape[0]
+            
             frames = (frames * 255).byte()
 
             if len(frames.shape) == 3:
@@ -596,7 +601,52 @@ class LatentSyncNode:
             # Read the processed video - ensure it's loaded as CPU tensor
             processed_frames = io.read_video(output_video_path, pts_unit='sec')[0]
             processed_frames = processed_frames.float() / 255.0
-
+            
+            # If preserve_frame_count is enabled and the frame counts don't match
+            if preserve_frame_count and original_frame_count != processed_frames.shape[0]:
+                print(f"Preserving original frame count: {original_frame_count} (processed: {processed_frames.shape[0]})")
+                
+                # We need to resample the frames to match the original count
+                # Using a high-quality interpolation to maintain the lip sync quality
+                processed_frames_tensor = torch.tensor(processed_frames)
+                if len(processed_frames_tensor.shape) == 4:  # [frames, height, width, channels]
+                    processed_frames_tensor = processed_frames_tensor.permute(0, 3, 1, 2)  # to [frames, channels, height, width]
+                
+                # Create time indices for original and processed frames
+                src_times = torch.linspace(0, 1, processed_frames.shape[0])
+                target_times = torch.linspace(0, 1, original_frame_count)
+                
+                # Initialize output tensor
+                resampled_frames = torch.zeros((original_frame_count, processed_frames_tensor.shape[1], 
+                                               processed_frames_tensor.shape[2], processed_frames_tensor.shape[3]))
+                
+                # Linear interpolation between frames (more complex interpolation could be used)
+                for i, t in enumerate(target_times):
+                    # Find the two closest source frames
+                    if t <= src_times[0]:
+                        idx_pre, idx_post = 0, 0
+                        weight = 1.0
+                    elif t >= src_times[-1]:
+                        idx_pre, idx_post = -1, -1
+                        weight = 1.0
+                    else:
+                        # Find where t would be inserted to maintain order
+                        idx_post = torch.searchsorted(src_times, t)
+                        idx_pre = idx_post - 1
+                        
+                        # Calculate interpolation weight
+                        weight = (t - src_times[idx_pre]) / (src_times[idx_post] - src_times[idx_pre])
+                    
+                    # Interpolate
+                    if idx_pre == idx_post:
+                        resampled_frames[i] = processed_frames_tensor[idx_pre]
+                    else:
+                        resampled_frames[i] = (1 - weight) * processed_frames_tensor[idx_pre] + weight * processed_frames_tensor[idx_post]
+                
+                # Convert back to [frames, height, width, channels]
+                resampled_frames = resampled_frames.permute(0, 2, 3, 1)
+                processed_frames = resampled_frames
+            
             # Ensure audio is on CPU before returning
             if torch.cuda.is_available():
                 if hasattr(resampled_audio["waveform"], 'device') and resampled_audio["waveform"].device.type == 'cuda':
