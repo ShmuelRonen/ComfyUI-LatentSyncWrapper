@@ -277,13 +277,69 @@ def get_ext_dir(subpath=None, mkdir=False):
     
     return dir
 
-def download_model(url, save_path):
-    """Download a model from a URL and save it to the specified path."""
+def download_model(url, save_path, max_retries=3):
+    """Download a model from a URL and save it to the specified path with retry logic."""
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    response = requests.get(url, stream=True)
-    with open(save_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
+    
+    # Implement retry logic with exponential backoff
+    for attempt in range(max_retries):
+        try:
+            print(f"Downloading from {url} (attempt {attempt + 1}/{max_retries})...")
+            response = requests.get(url, stream=True, timeout=60)
+            response.raise_for_status()  # Raise exception for HTTP errors
+            
+            # Download to a temporary file first
+            temp_path = f"{save_path}.downloading"
+            with open(temp_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            # Rename the temporary file to the final path
+            if os.path.exists(save_path):
+                os.remove(save_path)
+            os.rename(temp_path, save_path)
+            
+            return True
+        except (requests.exceptions.RequestException, IOError) as e:
+            wait_time = 2 ** attempt  # Exponential backoff
+            print(f"Download attempt {attempt + 1} failed: {str(e)}")
+            print(f"Retrying in {wait_time} seconds...")
+            import time
+            time.sleep(wait_time)
+    
+    print(f"Failed to download after {max_retries} attempts")
+    return False
+
+def validate_pytorch_model(file_path):
+    """
+    Validate that a PyTorch model file is not corrupted by attempting to load it.
+    
+    Args:
+        file_path: Path to the .pt model file
+        
+    Returns:
+        bool: True if the model is valid, False if corrupted
+    """
+    if not os.path.exists(file_path):
+        print(f"Model file does not exist: {file_path}")
+        return False
+        
+    try:
+        # Just load the file headers without loading the whole model
+        # This is enough to check if the zip archive is valid
+        _ = torch.jit.load(file_path, map_location='cpu') if file_path.endswith('.pt') else torch.load(file_path, map_location='cpu')
+        return True
+    except RuntimeError as e:
+        if "PytorchStreamReader failed reading zip archive" in str(e):
+            print(f"Corrupted model file detected: {file_path}")
+            print(f"Error: {str(e)}")
+            return False
+        # Other errors might be due to model architecture, which means the file itself is valid
+        return True
+    except Exception as e:
+        print(f"Error validating model file {file_path}: {str(e)}")
+        # Be conservative - if we're not sure, assume it's corrupted
+        return False
 
 def pre_download_models():
     """Pre-download all required models."""
@@ -325,24 +381,119 @@ def setup_models():
     unet_path = os.path.join(ckpt_dir, "latentsync_unet.pt")
     whisper_path = os.path.join(whisper_dir, "tiny.pt")
 
-    if not (os.path.exists(unet_path) and os.path.exists(whisper_path)):
-        print("Downloading required model checkpoints... This may take a while.")
-        try:
-            from huggingface_hub import snapshot_download
-            snapshot_download(repo_id="ByteDance/LatentSync-1.5",
-                             allow_patterns=["latentsync_unet.pt", "whisper/tiny.pt"],
-                             local_dir=ckpt_dir, 
-                             local_dir_use_symlinks=False,
-                             cache_dir=temp_downloads)
-            print("Model checkpoints downloaded successfully!")
-        except Exception as e:
-            print(f"Error downloading models: {str(e)}")
-            print("\nPlease download models manually:")
-            print("1. Visit: https://huggingface.co/chunyu-li/LatentSync")
+    # List of model repositories to try, in order of preference
+    repos = [
+        "ByteDance/LatentSync-1.5",  # Primary source
+        "chunyu-li/LatentSync"       # Alternative source
+    ]
+    
+    # Direct download URLs for fallback
+    direct_urls = {
+        "latentsync_unet.pt": "https://huggingface.co/ByteDance/LatentSync-1.5/resolve/main/latentsync_unet.pt",
+        "whisper/tiny.pt": "https://huggingface.co/ByteDance/LatentSync-1.5/resolve/main/whisper/tiny.pt"
+    }
+    
+    # Check for existing files and validate them
+    models_valid = True
+    if os.path.exists(unet_path):
+        if not validate_pytorch_model(unet_path):
+            print(f"Detected corrupted model file: {unet_path}")
+            os.remove(unet_path)
+            models_valid = False
+    else:
+        models_valid = False
+        
+    if os.path.exists(whisper_path):
+        if not validate_pytorch_model(whisper_path):
+            print(f"Detected corrupted model file: {whisper_path}")
+            os.remove(whisper_path)
+            models_valid = False
+    else:
+        models_valid = False
+    
+    # If models are missing or invalid, try to download them
+    if not models_valid:
+        print("Downloading or repairing model checkpoints... This may take a while.")
+        
+        download_success = False
+        
+        # Try using huggingface_hub if available
+        for repo in repos:
+            if download_success:
+                break
+                
+            try:
+                print(f"Trying to download from {repo}...")
+                from huggingface_hub import snapshot_download
+                snapshot_download(
+                    repo_id=repo,
+                    allow_patterns=["latentsync_unet.pt", "whisper/tiny.pt"],
+                    local_dir=ckpt_dir, 
+                    local_dir_use_symlinks=False,
+                    cache_dir=temp_downloads
+                )
+                
+                # Validate the downloaded models
+                if not validate_pytorch_model(unet_path) or not validate_pytorch_model(whisper_path):
+                    print(f"Downloaded corrupted models from {repo}. Trying direct download...")
+                    # If validation fails, we'll try direct download
+                    if os.path.exists(unet_path):
+                        os.remove(unet_path)
+                    if os.path.exists(whisper_path):
+                        os.remove(whisper_path)
+                else:
+                    download_success = True
+                    print(f"Models downloaded and validated successfully from {repo}!")
+                    
+            except Exception as e:
+                print(f"Error using huggingface_hub to download from {repo}: {str(e)}")
+                # Continue to next repo or direct download
+        
+        # If huggingface_hub failed, try direct downloads
+        if not download_success:
+            print("Trying direct downloads...")
+            direct_success = True
+            
+            # Download UNET model
+            if not os.path.exists(unet_path) or not validate_pytorch_model(unet_path):
+                if not download_model(direct_urls["latentsync_unet.pt"], unet_path):
+                    direct_success = False
+                elif not validate_pytorch_model(unet_path):
+                    print(f"Downloaded UNET model is corrupted.")
+                    os.remove(unet_path)
+                    direct_success = False
+            
+            # Download Whisper model
+            if not os.path.exists(whisper_path) or not validate_pytorch_model(whisper_path):
+                if not download_model(direct_urls["whisper/tiny.pt"], whisper_path):
+                    direct_success = False
+                elif not validate_pytorch_model(whisper_path):
+                    print(f"Downloaded Whisper model is corrupted.")
+                    os.remove(whisper_path)
+                    direct_success = False
+            
+            if direct_success:
+                download_success = True
+                print("Models downloaded and validated successfully through direct download!")
+        
+        # If all automatic methods failed, provide manual instructions
+        if not download_success:
+            print("\nAutomatic download failed. Please download models manually:")
+            print("1. Visit: https://huggingface.co/ByteDance/LatentSync-1.5")
             print("2. Download: latentsync_unet.pt and whisper/tiny.pt")
             print(f"3. Place them in: {ckpt_dir}")
             print(f"   with whisper/tiny.pt in: {whisper_dir}")
-            raise RuntimeError("Model download failed. See instructions above.")
+            raise RuntimeError("Model download failed. See instructions above for manual download.")
+    else:
+        print("All model files already exist and are valid!")
+        
+    # Clean up temporary files
+    try:
+        if os.path.exists(temp_downloads):
+            import shutil
+            shutil.rmtree(temp_downloads, ignore_errors=True)
+    except Exception as e:
+        print(f"Warning: Failed to clean up temporary download directory: {str(e)}")
 
 class LatentSyncNode:
     def __init__(self):
@@ -360,8 +511,59 @@ class LatentSyncNode:
             except:
                 pass
         
-        check_and_install_dependencies()
-        setup_models()
+        # Wrap initialization in a try-except block to handle errors gracefully
+        max_init_attempts = 2
+        for attempt in range(max_init_attempts):
+            try:
+                check_and_install_dependencies()
+                setup_models()
+                break  # If we get here, initialization was successful
+            except RuntimeError as e:
+                error_str = str(e)
+                
+                # Special handling for the zip archive error
+                if "PytorchStreamReader failed reading zip archive" in error_str:
+                    print("\n" + "="*80)
+                    print("DETECTED MODEL CORRUPTION ERROR")
+                    print("="*80)
+                    
+                    # Get paths to model files
+                    cur_dir = get_ext_dir()
+                    ckpt_dir = os.path.join(cur_dir, "checkpoints")
+                    unet_path = os.path.join(ckpt_dir, "latentsync_unet.pt")
+                    whisper_dir = os.path.join(ckpt_dir, "whisper")
+                    whisper_path = os.path.join(whisper_dir, "tiny.pt")
+                    
+                    # Clean up corrupted files
+                    for model_path in [unet_path, whisper_path]:
+                        if os.path.exists(model_path):
+                            try:
+                                # Rename first to avoid file lock issues
+                                corrupted_path = f"{model_path}.corrupted"
+                                os.rename(model_path, corrupted_path)
+                                os.remove(corrupted_path)
+                                print(f"Removed corrupted model file: {model_path}")
+                            except Exception as remove_err:
+                                print(f"Warning: Could not remove {model_path}: {str(remove_err)}")
+                    
+                    if attempt < max_init_attempts - 1:
+                        print("Attempting to re-download models...")
+                        continue
+                    else:
+                        print("\nMultiple initialization attempts failed. Please try:")
+                        print("1. Restart ComfyUI")
+                        print("2. Manually download the models as described in the error message")
+                        print("3. If the issue persists, report it on GitHub with this error information")
+                        raise RuntimeError("Failed to initialize LatentSyncNode after multiple attempts") from e
+                else:
+                    # For other errors, only retry once
+                    if attempt < max_init_attempts - 1:
+                        print(f"Initialization error: {error_str}")
+                        print("Retrying initialization...")
+                        continue
+                    else:
+                        # If this was our last attempt, re-raise the error
+                        raise
 
     @classmethod
     def INPUT_TYPES(s):
@@ -390,7 +592,51 @@ class LatentSyncNode:
                 processed_batch = processed_batch[..., :3]
             return processed_batch
 
+    def verify_model_integrity(self):
+        """
+        Verify the integrity of the model files before inference.
+        Returns True if all models are valid, False otherwise.
+        """
+        # Get model paths
+        cur_dir = get_ext_dir()
+        ckpt_dir = os.path.join(cur_dir, "checkpoints")
+        unet_path = os.path.join(ckpt_dir, "latentsync_unet.pt")
+        whisper_dir = os.path.join(ckpt_dir, "whisper")
+        whisper_path = os.path.join(whisper_dir, "tiny.pt")
+        
+        # Check if files exist and are valid
+        if not os.path.exists(unet_path):
+            print(f"UNET model file is missing: {unet_path}")
+            return False
+            
+        if not os.path.exists(whisper_path):
+            print(f"Whisper model file is missing: {whisper_path}")
+            return False
+            
+        # Validate the model files
+        if not validate_pytorch_model(unet_path):
+            print(f"UNET model file is corrupted: {unet_path}")
+            return False
+            
+        if not validate_pytorch_model(whisper_path):
+            print(f"Whisper model file is corrupted: {whisper_path}")
+            return False
+            
+        return True
+    
     def inference(self, images, audio, seed, lips_expression=1.5, inference_steps=20):
+        # First verify model integrity
+        if not self.verify_model_integrity():
+            # Try to fix the problem
+            try:
+                print("Attempting to repair model files...")
+                setup_models()
+                # Verify again after repair attempt
+                if not self.verify_model_integrity():
+                    raise RuntimeError("Model files could not be repaired automatically. Please try reinstalling the ComfyUI-LatentSyncWrapper extension.")
+            except Exception as e:
+                raise RuntimeError(f"Failed to repair model files: {str(e)}. Please try reinstalling the ComfyUI-LatentSyncWrapper extension.") from e
+                
         # Use our module temp directory
         global MODULE_TEMP_DIR
         
@@ -582,8 +828,26 @@ class LatentSyncNode:
             inference_temp = os.path.join(temp_dir, "temp")
             os.makedirs(inference_temp, exist_ok=True)
             
-            # Run inference
-            inference_module.main(config, args)
+            # Run inference with special error handling for model corruption
+            try:
+                inference_module.main(config, args)
+            except RuntimeError as e:
+                error_msg = str(e)
+                if "PytorchStreamReader failed reading zip archive" in error_msg:
+                    print("\n" + "="*80)
+                    print("DETECTED MODEL CORRUPTION ERROR DURING INFERENCE")
+                    print("="*80)
+                    print("One of the model files appears to be corrupted. Attempting to repair...")
+                    
+                    # Try to repair models
+                    setup_models()
+                    
+                    # Retry inference once
+                    print("Retrying inference with repaired models...")
+                    inference_module.main(config, args)
+                else:
+                    # Re-raise other errors
+                    raise
 
             # Clean GPU cache after inference
             if torch.cuda.is_available():
