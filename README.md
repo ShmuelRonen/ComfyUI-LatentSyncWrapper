@@ -122,7 +122,14 @@ The processed video will be saved in ComfyUI's output directory.
 - If you need higher quality results and have time to wait, increase inference_steps to 30-50
 - For quicker previews or less critical applications, reduce inference_steps to 10-15
 
-
+### Common issue in portable version
+For ComfyUI portable version users having this issue, here's how to fix the decord import error:
+First, locate your Python executable in the portable version:
+```
+python.exe -m pip uninstall decord
+python.exe -m pip install decord --no-cache-dir
+or use python3 instead
+```
 ## Known Limitations
 
 - Works best with clear, frontal face videos
