@@ -455,14 +455,13 @@ class LatentSyncNode:
             cur_dir = os.path.dirname(os.path.abspath(__file__))
             
             # Process input frames
+           # Process input frames entirely on CPU to avoid GPU OOM
             if isinstance(images, list):
-                frames = torch.stack(images).to(device)
+                frames_cpu = torch.stack(images)   # CPU tensor
             else:
-                frames = images.to(device)
- 
-            frames_cpu = frames.cpu()  
-            del frames  
-            torch.cuda.empty_cache()  
+                frames_cpu = images.detach().cpu()
+
+            torch.cuda.empty_cache()
 
             frames = (frames_cpu * 255).to(torch.uint8)
 
