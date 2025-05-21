@@ -2,14 +2,19 @@ from insightface.app import FaceAnalysis
 import numpy as np
 import torch
 
+
 INSIGHTFACE_DETECT_SIZE = 640
 
+import os
 
 class FaceDetector:
     def __init__(self, device="cuda"):
+        wrapper_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        model_root   = os.path.join(wrapper_root, "checkpoints", "auxiliary")
+        
         self.app = FaceAnalysis(
             allowed_modules=["detection", "landmark_2d_106"],
-            root="checkpoints/auxiliary",
+            root=str(model_root),
             providers=["CUDAExecutionProvider"],
         )
         self.app.prepare(ctx_id=cuda_to_int(device), det_size=(INSIGHTFACE_DETECT_SIZE, INSIGHTFACE_DETECT_SIZE))
