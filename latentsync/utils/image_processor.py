@@ -54,21 +54,26 @@ class ImageProcessor:
     def affine_transform(self, image: torch.Tensor) -> np.ndarray:
         if self.face_detector is None:
             raise NotImplementedError("Using the CPU for face detection is not supported")
-        bbox, landmark_2d_106 = self.face_detector(image)
-        if bbox is None:
-            raise RuntimeError("Face not detected")
+        try:
+            bbox, landmark_2d_106 = self.face_detector(image)
+            if bbox is None:
+                print("Warning: Face not detected in a frame. Skipping.")
+                return None, None, None
 
-        pt_left_eye = np.mean(landmark_2d_106[[43, 48, 49, 51, 50]], axis=0)  # left eyebrow center
-        pt_right_eye = np.mean(landmark_2d_106[101:106], axis=0)  # right eyebrow center
-        pt_nose = np.mean(landmark_2d_106[[74, 77, 83, 86]], axis=0)  # nose center
+            pt_left_eye = np.mean(landmark_2d_106[[43, 48, 49, 51, 50]], axis=0)  # left eyebrow center
+            pt_right_eye = np.mean(landmark_2d_106[101:106], axis=0)  # right eyebrow center
+            pt_nose = np.mean(landmark_2d_106[[74, 77, 83, 86]], axis=0)  # nose center
 
-        landmarks3 = np.round([pt_left_eye, pt_right_eye, pt_nose])
+            landmarks3 = np.round([pt_left_eye, pt_right_eye, pt_nose])
 
-        face, affine_matrix = self.restorer.align_warp_face(image.copy(), landmarks3=landmarks3, smooth=True)
-        box = [0, 0, face.shape[1], face.shape[0]]  # x1, y1, x2, y2
-        face = cv2.resize(face, (self.resolution, self.resolution), interpolation=cv2.INTER_LANCZOS4)
-        face = rearrange(torch.from_numpy(face), "h w c -> c h w")
-        return face, box, affine_matrix
+            face, affine_matrix = self.restorer.align_warp_face(image.copy(), landmarks3=landmarks3, smooth=True)
+            box = [0, 0, face.shape[1], face.shape[0]]  # x1, y1, x2, y2
+            face = cv2.resize(face, (self.resolution, self.resolution), interpolation=cv2.INTER_LANCZOS4)
+            face = rearrange(torch.from_numpy(face), "h w c -> c h w")
+            return face, box, affine_matrix
+        except Exception as e:
+            print(f"Warning: An error occurred during face detection: {e}. Skipping frame.")
+            return None, None, None
 
     def preprocess_fixed_mask_image(self, image: torch.Tensor, affine_transform=False):
         if affine_transform:

@@ -257,56 +257,91 @@ class LipsyncPipeline(DiffusionPipeline):
         affine_matrices = []
         print(f"Affine transforming {len(video_frames)} faces...")
         for frame in tqdm.tqdm(video_frames):
+            # This function now returns None, None, None on failure
             face, box, affine_matrix = self.image_processor.affine_transform(frame)
+            
+            # We append the results, including Nones, as placeholders
             faces.append(face)
             boxes.append(box)
             affine_matrices.append(affine_matrix)
 
-        faces = torch.stack(faces)
-        return faces, boxes, affine_matrices
+        # Filter out the None values for stacking, but keep track of which ones failed
+        valid_indices = [i for i, f in enumerate(faces) if f is not None]
+        if not valid_indices:
+            # If no faces were detected at all, we can't proceed with this logic.
+            # We'll return the placeholders and handle it in the restore_video step.
+            return faces, boxes, affine_matrices
 
-    def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list):
+        valid_faces = [faces[i] for i in valid_indices]
+        stacked_faces = torch.stack(valid_faces)
+        
+        # Re-insert the stacked tensors back into the list at the correct positions
+        final_faces = [None] * len(faces)
+        for i, idx in enumerate(valid_indices):
+            final_faces[idx] = stacked_faces[i]
+            
+        # We return the list with tensors and Nones
+        return final_faces, boxes, affine_matrices
+
+    def restore_video(self, faces: list, video_frames: np.ndarray, boxes: list, affine_matrices: list):
         video_frames = video_frames[: len(faces)]
         out_frames = []
         print(f"Restoring {len(faces)} faces...")
         for index, face in enumerate(tqdm.tqdm(faces)):
-            x1, y1, x2, y2 = boxes[index]
+            box = boxes[index]
+            affine_matrix = affine_matrices[index]
+
+            # FIX IS HERE: Check if face detection failed for this frame.
+            if box is None or affine_matrix is None:
+                # If it failed, use the original, unprocessed frame.
+                out_frames.append(video_frames[index])
+                continue
+
+            # If detection was successful, proceed with the restoration logic.
+            x1, y1, x2, y2 = box
             height = int(y2 - y1)
             width = int(x2 - x1)
-            face = torchvision.transforms.functional.resize(
+            restored_face = torchvision.transforms.functional.resize(
                 face, size=(height, width), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True
             )
-            out_frame = self.image_processor.restorer.restore_img(video_frames[index], face, affine_matrices[index])
+            out_frame = self.image_processor.restorer.restore_img(video_frames[index], restored_face, affine_matrix)
             out_frames.append(out_frame)
+            
         return np.stack(out_frames, axis=0)
 
     def loop_video(self, whisper_chunks: list, video_frames: np.ndarray):
         # If the audio is longer than the video, we need to loop the video
         if len(whisper_chunks) > len(video_frames):
+            # This function now returns a list, not a tensor
             faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
             num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
+            
             loop_video_frames = []
             loop_faces = []
             loop_boxes = []
             loop_affine_matrices = []
+            
             for i in range(num_loops):
                 if i % 2 == 0:
                     loop_video_frames.append(video_frames)
-                    loop_faces.append(faces)
-                    loop_boxes += boxes
-                    loop_affine_matrices += affine_matrices
+                    loop_faces.extend(faces)  # Use extend for lists
+                    loop_boxes.extend(boxes)
+                    loop_affine_matrices.extend(affine_matrices)
                 else:
-                    loop_video_frames.append(video_frames[::-1])
-                    loop_faces.append(faces.flip(0))
-                    loop_boxes += boxes[::-1]
-                    loop_affine_matrices += affine_matrices[::-1]
+                    # Reverse the lists for the "ping-pong" effect
+                    loop_video_frames.append(video_frames[::-1].copy())  # Use .copy() to be safe
+                    loop_faces.extend(faces[::-1])
+                    loop_boxes.extend(boxes[::-1])
+                    loop_affine_matrices.extend(affine_matrices[::-1])
 
             video_frames = np.concatenate(loop_video_frames, axis=0)[: len(whisper_chunks)]
-            faces = torch.cat(loop_faces, dim=0)[: len(whisper_chunks)]
+            # faces is now a list, so we just slice it
+            faces = loop_faces[: len(whisper_chunks)]
             boxes = loop_boxes[: len(whisper_chunks)]
             affine_matrices = loop_affine_matrices[: len(whisper_chunks)]
         else:
             video_frames = video_frames[: len(whisper_chunks)]
+            # This function returns a list, which is what we want
             faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
 
         return video_frames, faces, boxes, affine_matrices
@@ -351,10 +386,6 @@ class LipsyncPipeline(DiffusionPipeline):
 
         # 2. Check inputs
         self.check_inputs(height, width, callback_steps)
-
-        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-        # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # 3. set timesteps
@@ -370,104 +401,112 @@ class LipsyncPipeline(DiffusionPipeline):
         audio_samples = read_audio(audio_path)
         video_frames = read_video(video_path, use_decord=False)
 
-        video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
+        # This returns lists with None placeholders for failed detections
+        video_frames, faces_placeholders, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
 
-        synced_video_frames = []
-
+        # This will hold the final processed frames (tensors) or None for failed ones.
+        synced_frames_output = [None] * len(faces_placeholders)
+        
         num_channels_latents = self.vae.config.latent_channels
-
-        # Prepare latent variables
         all_latents = self.prepare_latents(
-            batch_size,
-            len(whisper_chunks),
-            num_channels_latents,
-            height,
-            width,
-            weight_dtype,
-            device,
-            generator,
+            batch_size, len(whisper_chunks), num_channels_latents, height, width, weight_dtype, device, generator
         )
 
         num_inferences = math.ceil(len(whisper_chunks) / num_frames)
         for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
-            if self.unet.add_audio_layer:
-                audio_embeds = torch.stack(whisper_chunks[i * num_frames : (i + 1) * num_frames])
-                audio_embeds = audio_embeds.to(device, dtype=weight_dtype)
-                if do_classifier_free_guidance:
-                    null_audio_embeds = torch.zeros_like(audio_embeds)
-                    audio_embeds = torch.cat([null_audio_embeds, audio_embeds])
-            else:
-                audio_embeds = None
-            inference_faces = faces[i * num_frames : (i + 1) * num_frames]
-            latents = all_latents[:, :, i * num_frames : (i + 1) * num_frames]
+            start_idx = i * num_frames
+            end_idx = min((i + 1) * num_frames, len(whisper_chunks))
+            
+            current_faces_chunk = faces_placeholders[start_idx:end_idx]
+            
+            # Identify which frames in this chunk are valid (have a face)
+            valid_indices_in_chunk = [j for j, f in enumerate(current_faces_chunk) if f is not None]
+
+            if not valid_indices_in_chunk:
+                print(f"Warning: No faces detected in chunk {i}. This chunk will use original frames.")
+                continue # The placeholders are already None, so we just skip processing.
+
+            # Create a tensor of only the valid faces for this chunk
+            valid_faces_tensor = torch.stack([current_faces_chunk[j] for j in valid_indices_in_chunk])
+            
+            # Process only the valid faces
             ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
-                inference_faces, affine_transform=False
+                valid_faces_tensor, affine_transform=False
             )
 
-            # 7. Prepare mask latent variables
+            # Get the corresponding latents for the valid frames
+            valid_latents_indices = [start_idx + j for j in valid_indices_in_chunk]
+            valid_latents = all_latents[:, :, valid_latents_indices, :, :]
+            
+            # Audio corresponds to the full chunk
+            if self.unet.add_audio_layer:
+                audio_embeds = torch.stack(whisper_chunks[start_idx:end_idx])
+                # We need to select the audio embeds that correspond to our valid frames
+                valid_audio_embeds = audio_embeds[valid_indices_in_chunk]
+                valid_audio_embeds = valid_audio_embeds.to(device, dtype=weight_dtype)
+                if do_classifier_free_guidance:
+                    null_audio_embeds = torch.zeros_like(valid_audio_embeds)
+                    valid_audio_embeds = torch.cat([null_audio_embeds, valid_audio_embeds])
+            else:
+                valid_audio_embeds = None
+                
             mask_latents, masked_image_latents = self.prepare_mask_latents(
-                masks,
-                masked_pixel_values,
-                height,
-                width,
-                weight_dtype,
-                device,
-                generator,
-                do_classifier_free_guidance,
+                masks, masked_pixel_values, height, width, weight_dtype, device, generator, do_classifier_free_guidance
             )
-
-            # 8. Prepare image latents
+            
             ref_latents = self.prepare_image_latents(
-                ref_pixel_values,
-                device,
-                weight_dtype,
-                generator,
-                do_classifier_free_guidance,
+                ref_pixel_values, device, weight_dtype, generator, do_classifier_free_guidance
             )
 
-            # 9. Denoising loop
+            # Denoising loop for the valid frames
+            denoised_latents = valid_latents
             num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for j, t in enumerate(timesteps):
-                    # expand the latents if we are doing classifier free guidance
-                    unet_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-
+                    unet_input = torch.cat([denoised_latents] * 2) if do_classifier_free_guidance else denoised_latents
                     unet_input = self.scheduler.scale_model_input(unet_input, t)
+                    unet_input = torch.cat([unet_input, mask_latents, masked_image_latents, ref_latents], dim=1)
+                    
+                    noise_pred = self.unet(unet_input, t, encoder_hidden_states=valid_audio_embeds).sample
 
-                    # concat latents, mask, masked_image_latents in the channel dimension
-                    unet_input = torch.cat(
-                        [unet_input, mask_latents, masked_image_latents, ref_latents], dim=1
-                    )
-
-                    # predict the noise residual
-                    noise_pred = self.unet(
-                        unet_input, t, encoder_hidden_states=audio_embeds
-                    ).sample
-
-                    # perform guidance
                     if do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_audio = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_audio - noise_pred_uncond)
 
-                    # compute the previous noisy sample x_t -> x_t-1
-                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
-
-                    # call the callback, if provided
+                    denoised_latents = self.scheduler.step(noise_pred, t, denoised_latents, **extra_step_kwargs).prev_sample
+                    
                     if j == len(timesteps) - 1 or ((j + 1) > num_warmup_steps and (j + 1) % self.scheduler.order == 0):
                         progress_bar.update()
-                        if callback is not None and j % callback_steps == 0:
-                            callback(j, t, latents)
 
-            # Recover the pixel values
-            decoded_latents = self.decode_latents(latents)
-            decoded_latents = self.paste_surrounding_pixels_back(
+            # Decode and paste back only the frames we processed
+            decoded_latents = self.decode_latents(denoised_latents)
+            pasted_frames = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
             )
-            synced_video_frames.append(decoded_latents)
+            
+            # Put the processed frames back into our main output list at their correct positions
+            for k, valid_idx in enumerate(valid_indices_in_chunk):
+                synced_frames_output[start_idx + valid_idx] = pasted_frames[k]
 
-        synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
-
-        audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
+        # After the main loop, call the restore function
+        # Now, we use the original frames for the None placeholders
+        for i in range(len(synced_frames_output)):
+            if synced_frames_output[i] is None:
+                # Convert numpy frame [H, W, C] to torch tensor [C, H, W]
+                original_frame_tensor = torch.from_numpy(video_frames[i]).permute(2, 0, 1).float()
+                # Resize the original frame to the target resolution (e.g., 512x512)
+                original_frame_tensor_resized = torchvision.transforms.functional.resize(
+                    original_frame_tensor, size=(height, width), antialias=True
+                )
+                # Normalize to -1 to 1
+                normalized_frame = (original_frame_tensor_resized / 255.0 - 0.5) * 2
+                synced_frames_output[i] = normalized_frame.to(device, dtype=weight_dtype)
+                
+        # Now that all placeholders are filled, stack them into a single tensor for restore_video
+        synced_video_frames_tensor = torch.stack(synced_frames_output)
+        final_video_frames = self.restore_video(synced_video_frames_tensor, video_frames, boxes, affine_matrices)
+        
+        audio_samples_remain_length = int(final_video_frames.shape[0] / video_fps * audio_sample_rate)
         audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
 
         if is_train:
@@ -478,8 +517,7 @@ class LipsyncPipeline(DiffusionPipeline):
             shutil.rmtree(temp_dir)
         os.makedirs(temp_dir, exist_ok=True)
 
-        write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=25)
-
+        write_video(os.path.join(temp_dir, "video.mp4"), final_video_frames, fps=25)
         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
 
         command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
