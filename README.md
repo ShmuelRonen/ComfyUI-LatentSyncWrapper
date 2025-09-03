@@ -86,7 +86,7 @@ DeepCache
 
 **Easiest method**: Download the complete pre-configured checkpoints folder:
 
-1. **Download the 7zip archive**: https://drive.google.com/file/d/1OTZQdFv7Bnz9MIgZowj_dXTaLjQwjEMy/view?usp=sharing
+1. **Download the 7zip archive**: https://drive.google.com/file/d/1uGdFgjGV_rKlF0CyTToTRxhDsR0Y-dl_/view?usp=sharing
 2. **Extract the archive** to get the complete `checkpoints` folder
 3. **Replace/merge** with your existing `checkpoints` folder in the extension directory
 4. **All models included** - no additional downloads needed!
