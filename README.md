@@ -82,20 +82,7 @@ DeepCache
 
 **Important**: LatentSync 1.6 requires manual model downloads because the LatentSync 1.6 models are hosted on a private HuggingFace repository that cannot be automatically accessed. You must download the following models before first use:
 
-### Option 1: Complete Checkpoints Package (Recommended)
-
-**Easiest method**: Download the complete pre-configured checkpoints folder:
-
-1. **Download the 7zip archive**: https://drive.google.com/file/d/1uGdFgjGV_rKlF0CyTToTRxhDsR0Y-dl_/view?usp=sharing
-2. **Extract the archive** to get the complete `checkpoints` folder
-3. **Replace/merge** with your existing `checkpoints` folder in the extension directory
-4. **All models included** - no additional downloads needed!
-
-This package includes all required models: LatentSync 1.6, VAE, and auxiliary models.
-
-### Option 2: Manual Individual Downloads
-
-If you prefer to download models individually:
+### Manual Individual Downloads
 
 ### 1. VAE Model Download
 Create a `vae` folder inside your `checkpoints` directory and download the VAE model:
